@@ -117,9 +117,6 @@ app.post('/api/ideas/summary', getSummaryRequestLimit, async (req, res) => {
     const { owner, repository } = parsePublicGitHubRepository(repositoryUrl);
     const repositoryPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`;
     const metadata = await requestGitHubApi(repositoryPath);
-    if (!metadata.default_branch) {
-      return res.status(422).json({ error: 'This repository has no default branch to summarize.' });
-    }
     const [tree, readme] = await Promise.all([
       requestGitHubApi(`${repositoryPath}/git/trees/${encodeURIComponent(metadata.default_branch)}?recursive=1`),
       requestGitHubApi(`${repositoryPath}/readme`).catch((error) => {
@@ -248,16 +245,6 @@ ${context}`;
     }
     if (error.name === 'TimeoutError' || error.name === 'AbortError') {
       return res.status(504).json({ error: 'Reading the repository timed out. Please try again.' });
-    }
-    if ([429, 503].includes(error.status)) {
-      return res.status(error.status).json({
-        error: error.status === 429
-          ? 'The AI summary service is rate limited. Please try again later.'
-          : 'The AI summary service is temporarily unavailable. Please try again later.',
-      });
-    }
-    if ([401, 403].includes(error.status)) {
-      return res.status(502).json({ error: 'The AI service rejected the server API key. Check GEMINI_API_KEY.' });
     }
     if (error instanceof TypeError && error.message.includes('fetch')) {
       console.error('Repository summary could not reach GitHub or the AI service.');
@@ -420,20 +407,6 @@ Instructions:
     }
     return res.status(502).json({ error: 'Chatpot could not get a response from Gemini. Check the server log for details.' });
   }
-});
-
-app.use((error, req, res, next) => {
-  if (res.headersSent) return next(error);
-
-  if (error.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'Request body must contain valid JSON.' });
-  }
-  if (error.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Request body is too large.' });
-  }
-
-  console.error('Unhandled API request error:', error.message);
-  return res.status(500).json({ error: 'An unexpected server error occurred.' });
 });
 
 const PORT = process.env.PORT || 5000;
