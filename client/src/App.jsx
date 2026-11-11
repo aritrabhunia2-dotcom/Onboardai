@@ -1,12 +1,16 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import './App.css';
 import {
   ArrowRight,
+  ArrowUpRight,
+  Activity,
   BriefcaseBusiness,
   Building2,
   Bug,
+  CalendarDays,
   CheckSquare,
+  CheckCircle2,
   CircleCheck,
   Clock3,
   Lightbulb,
@@ -16,13 +20,17 @@ import {
   LogOut,
   Mail,
   MessageSquare,
+  Plus,
+  Search,
   ShieldCheck,
   UserRound,
+  UserPlus,
   Users,
 } from 'lucide-react';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
+  || import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = supabaseUrl && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
@@ -41,6 +49,199 @@ const projectSections = [
   { id: 'plan', label: 'Plan' },
 ];
 
+const sampleProject = {
+  id: 'sample-customer-portal',
+  name: 'Customer Portal Redesign',
+  description: 'Rebuild the self-service customer portal with a new design experience for Atlas Retail Group.',
+  createdAt: '2026-09-10T00:00:00.000Z',
+};
+
+const projectDocumentDatabaseName = 'onboardai-project-documents';
+const projectDocumentStoreName = 'documents';
+const supportedDocumentTypes = /\.(?:pdf|doc|docx|odt|rtf|txt)$/i;
+const maxProjectDocumentSize = 25 * 1024 * 1024;
+const maxExtractedDocumentCharacters = 150000;
+
+const openProjectDocumentDatabase = () => new Promise((resolve, reject) => {
+  const request = window.indexedDB.open(projectDocumentDatabaseName, 1);
+  request.onupgradeneeded = () => {
+    request.result.createObjectStore(projectDocumentStoreName, { keyPath: 'id' });
+  };
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error || new Error('Project document storage could not be opened.'));
+});
+
+const saveProjectDocument = async (id, file) => {
+  const database = await openProjectDocumentDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(projectDocumentStoreName, 'readwrite');
+    transaction.objectStore(projectDocumentStoreName).put({ id, file });
+    transaction.oncomplete = () => {
+      database.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      database.close();
+      reject(transaction.error || new Error('The project document could not be saved.'));
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error || new Error('The project document could not be saved.'));
+    };
+  });
+};
+
+const loadProjectDocument = async (id) => {
+  const database = await openProjectDocumentDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(projectDocumentStoreName, 'readonly');
+    const request = transaction.objectStore(projectDocumentStoreName).get(id);
+    request.onsuccess = () => {
+      database.close();
+      resolve(request.result?.file || null);
+    };
+    request.onerror = () => {
+      database.close();
+      reject(request.error || new Error('The project document could not be loaded.'));
+    };
+  });
+};
+
+const extractDocumentText = async (file, fileName) => {
+  const extension = fileName.split('.').at(-1).toLowerCase();
+  if (extension === 'txt') return file.text();
+  if (extension === 'rtf') {
+    return (await file.text())
+      .replace(/\\'[0-9a-f]{2}/gi, (character) => String.fromCharCode(parseInt(character.slice(2), 16)))
+      .replace(/\\par[d]?|\\line\b/gi, '\n')
+      .replace(/\\u(-?\d+)\??/g, (_, code) => String.fromCharCode(Number(code) < 0 ? Number(code) + 65536 : Number(code)))
+      .replace(/\\'[0-9a-f]{2}/gi, '')
+      .replace(/\\[a-z]+-?\d* ?/gi, '')
+      .replace(/[{}]/g, '')
+      .slice(0, maxExtractedDocumentCharacters);
+  }
+  if (extension === 'doc') {
+    throw new Error('Legacy .doc files are not supported for milestone extraction. Save the document as .docx, .pdf, or .txt and upload it again.');
+  }
+  if (extension === 'docx') {
+    const mammothModule = await import('mammoth/mammoth.browser.js');
+    const mammoth = mammothModule.default || mammothModule;
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return result.value.slice(0, maxExtractedDocumentCharacters);
+  }
+  if (extension === 'odt') {
+    const JSZipModule = await import('jszip');
+    const JSZip = JSZipModule.default || JSZipModule;
+    const archive = await JSZip.loadAsync(await file.arrayBuffer());
+    const contentFile = archive.file('content.xml');
+    if (!contentFile) throw new Error('The OpenDocument file does not contain readable text.');
+    const xml = new DOMParser().parseFromString(await contentFile.async('text'), 'application/xml');
+    if (xml.querySelector('parsererror')) throw new Error('The OpenDocument file could not be read.');
+    return Array.from(xml.getElementsByTagName('*'))
+      .filter((element) => /(?:^|:)p$|(?:^|:)h$/.test(element.tagName))
+      .map((element) => element.textContent.trim())
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, maxExtractedDocumentCharacters);
+  }
+  if (extension === 'pdf') {
+    const [pdfjsLib, pdfWorkerModule] = await Promise.all([
+      import('pdfjs-dist'),
+      import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+    ]);
+    pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerModule.default;
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const pages = [];
+    let extractedCharacters = 0;
+    for (let pageNumber = 1; pageNumber <= pdf.numPages && extractedCharacters < maxExtractedDocumentCharacters; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      const textLines = [];
+      for (const item of content.items) {
+        if (!('str' in item) || !item.str.trim()) continue;
+        const y = item.transform[5];
+        let line = textLines.find((candidate) => Math.abs(candidate.y - y) < 3);
+        if (!line) {
+          line = { y, fragments: [] };
+          textLines.push(line);
+        }
+        line.fragments.push(item.str.trim());
+      }
+      const pageText = textLines
+        .sort((left, right) => right.y - left.y)
+        .map((line) => line.fragments.join(' '))
+        .join('\n');
+      pages.push(pageText);
+      extractedCharacters += pageText.length;
+    }
+    return pages.join('\n').slice(0, maxExtractedDocumentCharacters);
+  }
+  throw new Error('This file type cannot be read for milestone extraction. Use PDF, DOCX, ODT, RTF, or TXT.');
+};
+
+const createMilestonesFromText = (text) => {
+  const actionPattern = /\b(?:create|build|develop|design|implement|deliver|launch|deploy|test|review|validate|research|define|plan|prepare|complete|integrate|migrate|configure|document|train|release|improve|set up|update|finali[sz]e|approve|analy[sz]e|gather|collect|identify|measure|monitor|roll out|prototype|audit|onboard|publish|submit)\b/i;
+  const candidates = text
+    .replace(/\r/g, '\n')
+    .split(/\n+/)
+    .flatMap((line) => {
+      const isListItem = /^\s*(?:[-*•]|\d+[.)])\s+/.test(line);
+      const normalized = line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').replace(/\s+/g, ' ').trim();
+      const segments = normalized.split(/(?<=[.!?])\s+|;\s+/);
+      return segments.filter((segment) => (
+        segment.length >= 18
+        && segment.length <= 240
+        && (isListItem || actionPattern.test(segment))
+      ));
+    })
+    .map((candidate) => candidate.replace(/^[\s:;,-]+|[\s;,-]+$/g, ''))
+    .filter((candidate, index, list) => list.findIndex((item) => item.toLowerCase() === candidate.toLowerCase()) === index)
+    .slice(0, 18);
+
+  if (candidates.length < 2) {
+    throw new Error('Not enough clear action items were found to build milestones. Add specific steps or deliverables to the document and try again.');
+  }
+
+  const milestoneCount = Math.min(6, candidates.length);
+  const milestones = Array.from({ length: milestoneCount }, (_, index) => {
+    const start = Math.floor(index * candidates.length / milestoneCount);
+    const end = Math.floor((index + 1) * candidates.length / milestoneCount);
+    const items = candidates.slice(start, end);
+    const title = items[0].replace(/[.!?]+$/, '');
+    return {
+      id: crypto.randomUUID(),
+      title: title.length > 90 ? `${title.slice(0, 87).trimEnd()}...` : title,
+      details: items.slice(1).join(' '),
+      status: 'Not started',
+    };
+  });
+
+  return milestones;
+};
+
+const getInitialProjects = () => {
+  try {
+    const savedProjects = window.localStorage.getItem('onboardai-projects');
+    if (!savedProjects) return [sampleProject];
+    const projects = JSON.parse(savedProjects);
+    if (!Array.isArray(projects)) return [sampleProject];
+    return [
+      sampleProject,
+      ...projects.filter((project) => (
+        project
+        && typeof project.id === 'string'
+        && typeof project.name === 'string'
+        && typeof project.description === 'string'
+        && typeof project.createdAt === 'string'
+        && project.id !== sampleProject.id
+      )),
+    ];
+  } catch (error) {
+    console.error('Saved projects could not be loaded:', error);
+    return [sampleProject];
+  }
+};
+
 const issueSections = [
   { id: 'bugs', label: 'Bugs' },
   { id: 'blockers', label: 'Blockers' },
@@ -57,6 +258,20 @@ const ideaSections = [
 const timesheetSections = [
   { id: 'deadline', label: 'Submission Deadline' },
   { id: 'time-given', label: 'Time Already Given' },
+];
+
+const demoTeamMembers = [
+  { id: 'maya', name: 'Maya Patel', role: 'Product Designer', email: 'maya.patel@example.com', initials: 'MP', color: 'violet', status: 'Working', tasksDone: 8, tasksTotal: 10, focus: 'Checkout flow redesign' },
+  { id: 'ethan', name: 'Ethan Chen', role: 'Frontend Engineer', email: 'ethan.chen@example.com', initials: 'EC', color: 'blue', status: 'Working', tasksDone: 6, tasksTotal: 9, focus: 'Customer dashboard' },
+  { id: 'sofia', name: 'Sofia Rivera', role: 'Backend Engineer', email: 'sofia.rivera@example.com', initials: 'SR', color: 'amber', status: 'In review', tasksDone: 5, tasksTotal: 8, focus: 'Payments API integration' },
+  { id: 'noah', name: 'Noah Williams', role: 'Project Manager', email: 'noah.williams@example.com', initials: 'NW', color: 'green', status: 'Away', tasksDone: 7, tasksTotal: 8, focus: 'Sprint planning' },
+];
+
+const demoTeamActivity = [
+  { id: 'activity-1', initials: 'MP', color: 'violet', name: 'Maya Patel', action: 'completed', subject: 'Checkout wireframes', project: 'Customer Portal Redesign', time: '12 min ago', icon: CheckCircle2 },
+  { id: 'activity-2', initials: 'EC', color: 'blue', name: 'Ethan Chen', action: 'started working on', subject: 'Responsive dashboard layout', project: 'Customer Portal Redesign', time: '38 min ago', icon: CircleCheck },
+  { id: 'activity-3', initials: 'SR', color: 'amber', name: 'Sofia Rivera', action: 'submitted for review', subject: 'Payment API integration', project: 'Billing Experience', time: '1 hr ago', icon: Activity },
+  { id: 'activity-4', initials: 'NW', color: 'green', name: 'Noah Williams', action: 'created a milestone', subject: 'Beta release readiness', project: 'Mobile App Launch', time: '2 hrs ago', icon: CalendarDays },
 ];
 
 const bugs = [];
@@ -109,6 +324,22 @@ export default function App() {
   const [ideaLoading, setIdeaLoading] = useState(false);
   const [ideaError, setIdeaError] = useState('');
   const [projectSearch, setProjectSearch] = useState('');
+  const [teamSearch, setTeamSearch] = useState('');
+  const [teamRoleFilter, setTeamRoleFilter] = useState('All roles');
+  const [teamInviteNotice, setTeamInviteNotice] = useState(false);
+  const [projects, setProjects] = useState(getInitialProjects);
+  const [selectedProjectId, setSelectedProjectId] = useState(sampleProject.id);
+  const [showCreateProject, setShowCreateProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectDescription, setNewProjectDescription] = useState('');
+  const [newProjectDocument, setNewProjectDocument] = useState(null);
+  const projectDocumentInputRef = useRef(null);
+  const [createProjectSubmitting, setCreateProjectSubmitting] = useState(false);
+  const [createProjectError, setCreateProjectError] = useState('');
+  const [generatingMilestonesProjectId, setGeneratingMilestonesProjectId] = useState('');
+  const [milestoneGenerationError, setMilestoneGenerationError] = useState('');
+  const [goalDocuments, setGoalDocuments] = useState([]);
+  const [goalDocumentError, setGoalDocumentError] = useState('');
   const [dependencyResolved, setDependencyResolved] = useState(false);
   const [chatQuery, setChatQuery] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
@@ -128,6 +359,14 @@ export default function App() {
   const [authPassword, setAuthPassword] = useState('');
   const activeGoalSection = goalSections.find((section) => section.id === activeGoalTab);
   const activeIdeaSection = ideaSections.find((section) => section.id === activeIdeaTab);
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) || sampleProject;
+  const visibleProjects = projects.filter((project) => (
+    project.name.toLowerCase().includes(projectSearch.trim().toLowerCase())
+  ));
+  const visibleTeamMembers = demoTeamMembers.filter((member) => (
+    (teamRoleFilter === 'All roles' || member.role === teamRoleFilter)
+    && `${member.name} ${member.role} ${member.email}`.toLowerCase().includes(teamSearch.trim().toLowerCase())
+  ));
 
   useEffect(() => {
     if (!supabase) return undefined;
@@ -161,6 +400,146 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        'onboardai-projects',
+        JSON.stringify(projects.filter((project) => project.id !== sampleProject.id)),
+      );
+    } catch (error) {
+      console.error('Projects could not be saved in this browser:', error);
+    }
+  }, [projects]);
+
+  useEffect(() => {
+    if (activeTab !== 'goals') return undefined;
+    let active = true;
+    const objectUrls = [];
+
+    const loadGoalDocuments = async () => {
+      setGoalDocumentError('');
+      try {
+        const documents = await Promise.all(projects
+          .filter((project) => project.document?.id && project.document?.name)
+          .map(async (project) => {
+            const file = await loadProjectDocument(project.document.id);
+            if (!file) return { ...project.document, projectName: project.name, url: null };
+            if (!active) return { ...project.document, projectName: project.name, url: null };
+            const url = URL.createObjectURL(file);
+            objectUrls.push(url);
+            return { ...project.document, projectName: project.name, url };
+          }));
+        if (active) setGoalDocuments(documents);
+      } catch (error) {
+        console.error('Goal documents could not be loaded:', error);
+        objectUrls.forEach((url) => URL.revokeObjectURL(url));
+        objectUrls.length = 0;
+        if (active) setGoalDocumentError('Project documents could not be loaded from this browser.');
+      }
+    };
+
+    loadGoalDocuments();
+    return () => {
+      active = false;
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [activeTab, projects]);
+
+  const handleCreateProject = async (event) => {
+    event.preventDefault();
+    const name = newProjectName.trim();
+    if (!name) {
+      setCreateProjectError('Enter a project name using at least one non-space character.');
+      return;
+    }
+
+    if (newProjectDocument && !supportedDocumentTypes.test(newProjectDocument.name)) {
+      setCreateProjectError('Choose a PDF or a supported document file (DOC, DOCX, ODT, RTF, or TXT).');
+      return;
+    }
+    if (newProjectDocument && newProjectDocument.size > maxProjectDocumentSize) {
+      setCreateProjectError('Choose a document smaller than 25 MB.');
+      return;
+    }
+
+    setCreateProjectSubmitting(true);
+    setCreateProjectError('');
+    const projectId = crypto.randomUUID();
+    const documentId = newProjectDocument ? crypto.randomUUID() : null;
+    try {
+      if (newProjectDocument) {
+        await saveProjectDocument(documentId, newProjectDocument);
+      }
+      const project = {
+        id: projectId,
+        name,
+        description: newProjectDescription.trim(),
+        createdAt: new Date().toISOString(),
+        ...(newProjectDocument && {
+          document: {
+            id: documentId,
+            name: newProjectDocument.name,
+            type: newProjectDocument.type,
+            size: newProjectDocument.size,
+          },
+        }),
+      };
+
+      setProjects((currentProjects) => [...currentProjects, project]);
+      setSelectedProjectId(project.id);
+      setActiveProjectTab('overview');
+      setProjectSearch('');
+      setNewProjectName('');
+      setNewProjectDescription('');
+      setNewProjectDocument(null);
+      setShowCreateProject(false);
+    } catch (error) {
+      console.error('Project could not be created:', error);
+      setCreateProjectError('The project or its document could not be saved in this browser. Check available storage and try again.');
+    } finally {
+      setCreateProjectSubmitting(false);
+    }
+  };
+
+  const closeCreateProjectForm = () => {
+    if (createProjectSubmitting) return;
+    setShowCreateProject(false);
+    setNewProjectName('');
+    setNewProjectDescription('');
+    setNewProjectDocument(null);
+    setCreateProjectError('');
+  };
+
+  const handleGenerateMilestones = async (project) => {
+    if (!project.document?.id || generatingMilestonesProjectId) return;
+    setGeneratingMilestonesProjectId(project.id);
+    setMilestoneGenerationError('');
+    try {
+      const file = await loadProjectDocument(project.document.id);
+      if (!file) throw new Error('The saved document is unavailable in this browser. Re-upload it in the project.');
+      const text = await extractDocumentText(file, project.document.name);
+      if (!text.trim()) {
+        throw new Error('No readable text was found in this document. Scanned PDFs need OCR before they can be used.');
+      }
+      const milestones = createMilestonesFromText(text);
+      setProjects((currentProjects) => currentProjects.map((item) => (
+        item.id === project.id
+          ? {
+            ...item,
+            milestones,
+            milestonesGeneratedAt: new Date().toISOString(),
+            milestonesSourceDocumentId: project.document.id,
+          }
+          : item
+      )));
+    } catch (error) {
+      console.error(`Milestones could not be generated from ${project.document.name}:`, error);
+      setMilestoneGenerationError(`${project.name}: ${error.message || 'The document could not be read.'}`);
+    } finally {
+      setGeneratingMilestonesProjectId('');
+    }
+  };
+
+  useEffect(() => {
     if (activeTab !== 'timesheet') return undefined;
     const timerId = window.setInterval(() => setTimesheetNow(Date.now()), 1000);
     return () => window.clearInterval(timerId);
@@ -175,8 +554,11 @@ export default function App() {
     setAuthSubmitting(true);
 
     try {
-      const deadlineIso = new Date(timesheetDeadline).toISOString();
       if (authMode === 'signup') {
+        const deadline = new Date(timesheetDeadline);
+        if (Number.isNaN(deadline.getTime())) {
+          throw new Error('Choose a valid timesheet submission deadline.');
+        }
         const { data, error } = await supabase.auth.signUp({
           email: authEmail,
           password: authPassword,
@@ -186,7 +568,7 @@ export default function App() {
               full_name: fullName.trim(),
               employer_name: employerName.trim(),
               job_title: jobTitle.trim(),
-              timesheet_deadline: deadlineIso,
+              timesheet_deadline: deadline.toISOString(),
             },
           },
         });
@@ -200,12 +582,8 @@ export default function App() {
           password: authPassword,
         });
         if (error) throw error;
-        const { data: updatedUser, error: updateError } = await supabase.auth.updateUser({
-          data: { timesheet_deadline: deadlineIso },
-        });
-        if (updateError) throw updateError;
-        setTimesheetDeadline(toLocalDateTimeInput(updatedUser.user.user_metadata.timesheet_deadline));
-        setAuthUser(updatedUser.user || data.user);
+        setTimesheetDeadline(toLocalDateTimeInput(data.user?.user_metadata?.timesheet_deadline));
+        setAuthUser(data.user);
       }
       setAuthPassword('');
     } catch (error) {
@@ -315,7 +693,12 @@ export default function App() {
         body: JSON.stringify({ repositoryUrl }),
         signal: AbortSignal.timeout(90000),
       });
-      const data = await response.json();
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error(`Project Ideas received an unreadable server response (${response.status}). Verify that the backend is running and try again.`);
+      }
       if (!response.ok) throw new Error(data.error || `Repository summary failed (${response.status}).`);
       if (!data.repository || !data.summary) throw new Error('The server returned an incomplete repository summary.');
       setIdeaSummary(data);
@@ -457,19 +840,21 @@ export default function App() {
                   </>
                 )}
 
-                <label className="block text-sm font-medium text-slate-700">
-                  Timesheet submission deadline (your local time)
-                  <span className="relative mt-1.5 block">
-                    <input
-                      type="datetime-local"
-                      name="timesheet-deadline"
-                      required
-                      value={timesheetDeadline}
-                      onChange={(event) => setTimesheetDeadline(event.target.value)}
-                      className="w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-                    />
-                  </span>
-                </label>
+                {authMode === 'signup' && (
+                  <label className="block text-sm font-medium text-slate-700">
+                    Timesheet submission deadline (your local time)
+                    <span className="relative mt-1.5 block">
+                      <input
+                        type="datetime-local"
+                        name="timesheet-deadline"
+                        required
+                        value={timesheetDeadline}
+                        onChange={(event) => setTimesheetDeadline(event.target.value)}
+                        className="w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                      />
+                    </span>
+                  </label>
+                )}
 
                 <label className="block text-sm font-medium text-slate-700">
                   Email address
@@ -719,7 +1104,7 @@ export default function App() {
                   {!supabase && (
                     <div className="mb-5 border-l-4 border-amber-500 bg-amber-50 p-3 text-sm leading-5 text-amber-950" role="status">
                       <p className="font-semibold">Connect Supabase to enable account access.</p>
-                      <p className="mt-1">Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> to <code>client/.env.local</code>, then restart the client. Use a publishable anon key, never a service-role key.</p>
+                      <p className="mt-1">Add <code>VITE_SUPABASE_URL</code> and either <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> or <code>VITE_SUPABASE_ANON_KEY</code> to <code>client/.env.local</code>, then restart the client. Use a publishable key, never a service-role key.</p>
                     </div>
                   )}
 
@@ -930,24 +1315,109 @@ export default function App() {
                 <button
                   type="button"
                   className="project-list-button"
-                  aria-label="Add project (not available yet)"
-                  title="Project creation is not available yet"
-                  disabled
+                  aria-label="Create project"
+                  title="Create project"
+                  onClick={() => setShowCreateProject(true)}
                 >
-                  +
+                  <Plus size={17} aria-hidden="true" />
                 </button>
               </div>
 
-              {'Customer Portal Redesign'.toLowerCase().includes(projectSearch.trim().toLowerCase()) ? (
-                <div className="project-item active-project-item" aria-current="true">
-                  <span className="project-item-name">Customer Portal Redesign</span>
-                </div>
+              {visibleProjects.length > 0 ? (
+                visibleProjects.map((project) => (
+                  <button
+                    key={project.id}
+                    type="button"
+                    className={`project-item${selectedProjectId === project.id ? ' active-project-item' : ''}`}
+                    aria-current={selectedProjectId === project.id ? 'true' : undefined}
+                    onClick={() => setSelectedProjectId(project.id)}
+                  >
+                    <span className="project-item-name">{project.name}</span>
+                  </button>
+                ))
               ) : (
                 <p className="project-search-empty" role="status">No projects match your search.</p>
               )}
             </aside>
 
-            <section className="project-detail-panel" aria-label="Customer Portal Redesign overview">
+            <section className="project-detail-panel" aria-label={`${selectedProject.name} overview`}>
+              {selectedProject.id !== sampleProject.id ? (
+                <>
+                  <div className="project-header-row">
+                    <div>
+                      <div className="project-breadcrumb">Projects</div>
+                      <h2>{selectedProject.name}</h2>
+                    </div>
+                    <div className="project-header-meta">
+                      <span>Created {new Date(selectedProject.createdAt).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                  <div className="project-summary project-created-summary">
+                    <div className="project-summary-text">
+                      <h3>{selectedProject.description || 'No project description has been added.'}</h3>
+                      <p>Your project is ready. Add tasks, documents, and plan items as work begins.</p>
+                    </div>
+                  </div>
+                  <div className="project-tabs" role="tablist" aria-label="Project sections">
+                    {projectSections.map((tab) => (
+                      <button
+                        key={tab.id}
+                        id={`project-tab-${tab.id}`}
+                        type="button"
+                        role="tab"
+                        aria-selected={activeProjectTab === tab.id}
+                        aria-controls="project-tab-panel"
+                        className={`project-tab${activeProjectTab === tab.id ? ' active' : ''}`}
+                        onClick={() => setActiveProjectTab(tab.id)}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                  <section
+                    id="project-tab-panel"
+                    className="project-tab-panel"
+                    role="tabpanel"
+                    aria-labelledby={`project-tab-${activeProjectTab}`}
+                    tabIndex={0}
+                  >
+                    {activeProjectTab === 'documents' && selectedProject.document ? (
+                      <div className="project-empty-state">
+                        <h3>Project documents</h3>
+                        <p>Your uploaded project document is ready to view.</p>
+                        <ul className="goal-document-list">
+                          <li className="goal-document-item">
+                            <span className="goal-document-icon" aria-hidden="true">
+                              {selectedProject.document.name.split('.').at(-1).toUpperCase()}
+                            </span>
+                            <span className="goal-document-details">
+                              <strong>{selectedProject.document.name}</strong>
+                              <small>{selectedProject.name}</small>
+                            </span>
+                            <button
+                              type="button"
+                              className="goal-document-link"
+                              onClick={() => setActiveTab('goals')}
+                            >
+                              View in Goals
+                            </button>
+                          </li>
+                        </ul>
+                      </div>
+                    ) : (
+                      <div className="project-empty-state">
+                        <h3>{activeProjectTab === 'overview' ? 'Project overview' : `Project ${activeProjectTab}`}</h3>
+                        <p>
+                          {activeProjectTab === 'overview'
+                            ? 'This project has been created. Project activity and progress will appear here as you add work.'
+                            : `No ${activeProjectTab} have been added to this project yet.`}
+                        </p>
+                      </div>
+                    )}
+                  </section>
+                </>
+              ) : (
+                <>
               {!dependencyResolved && (
                 <div className="project-alert">
                   <span className="project-alert-badge" aria-hidden="true">!</span>
@@ -1069,7 +1539,11 @@ export default function App() {
                 {activeProjectTab === 'documents' && (
                   <div className="project-empty-state">
                     <h3>Project documents</h3>
-                    <p>No documents have been added to this project yet.</p>
+                    {selectedProject.document ? (
+                      <p>{selectedProject.document.name} is attached to this project.</p>
+                    ) : (
+                      <p>No documents have been added to this project yet.</p>
+                    )}
                   </div>
                 )}
                 {activeProjectTab === 'plan' && (
@@ -1079,6 +1553,97 @@ export default function App() {
                   </div>
                 )}
               </section>
+                </>
+              )}
+            </section>
+          </div>
+        )}
+
+        {showCreateProject && (
+          <div className="project-modal-backdrop">
+            <section
+              className="project-create-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="create-project-title"
+            >
+              <div className="project-create-heading">
+                <div>
+                  <p className="dashboard-eyebrow">Projects</p>
+                  <h2 id="create-project-title">Create a project</h2>
+                </div>
+                <button
+                  type="button"
+                  className="project-modal-close"
+                  aria-label="Close create project form"
+                  onClick={closeCreateProjectForm}
+                  disabled={createProjectSubmitting}
+                >
+                  ×
+                </button>
+              </div>
+              <form className="project-create-form" onSubmit={handleCreateProject}>
+                <label htmlFor="new-project-name">Project name</label>
+                <input
+                  id="new-project-name"
+                  name="projectName"
+                  type="text"
+                  maxLength={100}
+                  required
+                  autoFocus
+                  value={newProjectName}
+                  onChange={(event) => {
+                    setNewProjectName(event.target.value);
+                    setCreateProjectError('');
+                  }}
+                  placeholder="e.g. Mobile app launch"
+                />
+                {createProjectError && <p className="project-form-error" role="alert">{createProjectError}</p>}
+                <label htmlFor="new-project-description">Description <span>(optional)</span></label>
+                <textarea
+                  id="new-project-description"
+                  name="projectDescription"
+                  rows={4}
+                  maxLength={500}
+                  value={newProjectDescription}
+                  onChange={(event) => setNewProjectDescription(event.target.value)}
+                  placeholder="What is this project working toward?"
+                />
+                <label htmlFor="new-project-document">Project document <span>(optional · PDF, DOC, DOCX, ODT, RTF, TXT · up to 25 MB)</span></label>
+                <input
+                  ref={projectDocumentInputRef}
+                  id="new-project-document"
+                  name="projectDocument"
+                  type="file"
+                  accept=".pdf,.doc,.docx,.odt,.rtf,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                  onChange={(event) => {
+                    setNewProjectDocument(event.target.files?.[0] || null);
+                    setCreateProjectError('');
+                  }}
+                />
+                {newProjectDocument && (
+                  <p className="project-document-selected" role="status">
+                    Selected: {newProjectDocument.name}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewProjectDocument(null);
+                        if (projectDocumentInputRef.current) projectDocumentInputRef.current.value = '';
+                      }}
+                    >
+                      Remove
+                    </button>
+                  </p>
+                )}
+                <div className="project-create-actions">
+                  <button type="button" className="project-cancel-button" onClick={closeCreateProjectForm} disabled={createProjectSubmitting}>
+                    Cancel
+                  </button>
+                  <button type="submit" className="project-submit-button" disabled={createProjectSubmitting}>
+                    {createProjectSubmitting ? 'Creating…' : 'Create project'}
+                  </button>
+                </div>
+              </form>
             </section>
           </div>
         )}
@@ -1114,6 +1679,100 @@ export default function App() {
             >
               <h3>{activeGoalSection.label}</h3>
               <p>{activeGoalSection.description}</p>
+              {activeGoalTab === 'roadmap' && (
+                <div className="milestone-roadmap-content">
+                  <p className="milestone-roadmap-note">
+                    Create a draft roadmap from action items in project documents. Parsing stays in this browser; review the suggested milestones before using them.
+                  </p>
+                  {milestoneGenerationError && <p className="project-form-error" role="alert">{milestoneGenerationError}</p>}
+                  {projects.filter((project) => project.document).length === 0 && (
+                    <p className="goal-documents-empty">Upload a project document when creating a project to generate milestones here.</p>
+                  )}
+                  {projects.filter((project) => project.document).map((project) => (
+                    <article className="roadmap-project" key={project.id}>
+                      <div className="roadmap-project-header">
+                        <div>
+                          <h4>{project.name}</h4>
+                          <p>Source: {project.document.name}</p>
+                        </div>
+                        <button
+                          type="button"
+                          className="milestone-generate-button"
+                          disabled={Boolean(generatingMilestonesProjectId)}
+                          onClick={() => handleGenerateMilestones(project)}
+                        >
+                          {generatingMilestonesProjectId === project.id
+                            ? 'Reading document…'
+                            : project.milestones?.length
+                              ? 'Regenerate milestones'
+                              : 'Generate milestones'}
+                        </button>
+                      </div>
+                      {project.milestones?.length > 0 ? (
+                        <>
+                          {project.milestonesSourceDocumentId !== project.document.id && (
+                            <p className="milestone-source-warning" role="status">
+                              The attached document changed; regenerate to refresh these milestones.
+                            </p>
+                          )}
+                          <ol className="milestone-list">
+                            {project.milestones.map((milestone, index) => (
+                              <li className="milestone-item" key={milestone.id || `${project.id}-${index}`}>
+                                <span className="milestone-number">{index + 1}</span>
+                                <div>
+                                  <h5>{milestone.title}</h5>
+                                  {milestone.details && <p>{milestone.details}</p>}
+                                  <span className="milestone-status">{milestone.status}</span>
+                                </div>
+                              </li>
+                            ))}
+                          </ol>
+                          <p className="milestone-generated-at">
+                            Drafted {new Date(project.milestonesGeneratedAt).toLocaleString()} using browser-based text rules.
+                          </p>
+                        </>
+                      ) : (
+                        <p className="goal-documents-empty">No milestones generated for this project yet.</p>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+            <section className="goal-documents-panel" aria-labelledby="goal-documents-heading">
+              <div className="goal-documents-heading">
+                <div>
+                  <p className="dashboard-eyebrow">Project resources</p>
+                  <h3 id="goal-documents-heading">Uploaded documents</h3>
+                </div>
+                <span>{goalDocuments.length} {goalDocuments.length === 1 ? 'file' : 'files'}</span>
+              </div>
+              {goalDocumentError && <p className="project-form-error" role="alert">{goalDocumentError}</p>}
+              {!goalDocumentError && goalDocuments.length === 0 && (
+                <p className="goal-documents-empty">No project documents yet. Add one when you create a project.</p>
+              )}
+              {goalDocuments.length > 0 && (
+                <ul className="goal-document-list">
+                  {goalDocuments.map((document) => (
+                    <li className="goal-document-item" key={document.id}>
+                      <span className="goal-document-icon" aria-hidden="true">
+                        {document.name.split('.').at(-1).toUpperCase()}
+                      </span>
+                      <span className="goal-document-details">
+                        <strong>{document.name}</strong>
+                        <small>{document.projectName}</small>
+                      </span>
+                      {document.url ? (
+                        <a className="goal-document-link" href={document.url} target="_blank" rel="noreferrer">
+                          Open document
+                        </a>
+                      ) : (
+                        <span className="goal-document-unavailable">File unavailable</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </section>
           </div>
         )}
@@ -1239,6 +1898,11 @@ export default function App() {
             </form>
 
             {ideaError && <p className="idea-error" role="alert">{ideaError}</p>}
+            {ideaSummary?.summarySource === 'metadata-fallback' && (
+              <p className="idea-fallback-notice" role="status">
+                {ideaSummary.summaryNotice || 'Gemini was unavailable; this summary uses repository metadata and README excerpts instead.'}
+              </p>
+            )}
             {ideaSummary && (
               <div className="idea-repository-summary">
                 <h3>{ideaSummary.repository}</h3>
@@ -1429,11 +2093,168 @@ export default function App() {
         )}
 
         {activeTab === 'teams' && (
-          <div>
-            <h2 className="text-2xl font-bold mb-4 text-slate-800">Team</h2>
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <p className="text-slate-600 text-sm">Real-time developer activity stream and task progression charts.</p>
+          <div className="team-page">
+            <header className="dashboard-heading team-page-heading">
+              <div>
+                <p className="dashboard-eyebrow">Dashboard / Team</p>
+                <h2>Team workspace</h2>
+                <p className="team-page-subtitle">A snapshot of your people, project workload, and recent activity.</p>
+              </div>
+              <span className="demo-data-badge"><span /> Demo data</span>
+            </header>
+
+            <section className="team-metrics-grid" aria-label="Team summary">
+              <article className="team-metric-card">
+                <span className="team-metric-icon team-metric-icon-green"><Users size={18} aria-hidden="true" /></span>
+                <div><p>Team members</p><strong>12</strong><small>4 shown in this preview</small></div>
+              </article>
+              <article className="team-metric-card">
+                <span className="team-metric-icon team-metric-icon-blue"><CheckSquare size={18} aria-hidden="true" /></span>
+                <div><p>Tasks completed</p><strong>26 <small>/ 35</small></strong><small>Across active projects</small></div>
+              </article>
+              <article className="team-metric-card">
+                <span className="team-metric-icon team-metric-icon-amber"><Activity size={18} aria-hidden="true" /></span>
+                <div><p>Active projects</p><strong>3</strong><small>2 milestones due this week</small></div>
+              </article>
+              <article className="team-metric-card">
+                <span className="team-metric-icon team-metric-icon-violet"><CalendarDays size={18} aria-hidden="true" /></span>
+                <div><p>Sprint progress</p><strong>74%</strong><small>Current sprint · 8 days left</small></div>
+              </article>
+            </section>
+
+            <div className="team-content-grid">
+              <section className="team-panel team-members-panel" aria-labelledby="team-members-heading">
+                <div className="team-panel-heading">
+                  <div>
+                    <p className="dashboard-eyebrow">Your people</p>
+                    <h3 id="team-members-heading">Team members</h3>
+                  </div>
+                  <button
+                    type="button"
+                    className="team-invite-button"
+                    onClick={() => setTeamInviteNotice(true)}
+                  >
+                    <UserPlus size={16} aria-hidden="true" />
+                    Invite teammate
+                  </button>
+                </div>
+                {teamInviteNotice && (
+                  <p className="team-invite-notice" role="status">
+                    This is a demo workspace. Connect team accounts to send real invitations.
+                    <button type="button" onClick={() => setTeamInviteNotice(false)}>Dismiss</button>
+                  </p>
+                )}
+
+                <div className="team-member-controls">
+                  <label className="team-search-box">
+                    <Search size={16} aria-hidden="true" />
+                    <span className="sr-only">Search team members</span>
+                    <input
+                      type="search"
+                      placeholder="Search people..."
+                      value={teamSearch}
+                      onChange={(event) => setTeamSearch(event.target.value)}
+                    />
+                  </label>
+                  <label className="team-role-filter">
+                    <span className="sr-only">Filter team members by role</span>
+                    <select value={teamRoleFilter} onChange={(event) => setTeamRoleFilter(event.target.value)}>
+                      <option>All roles</option>
+                      {[...new Set(demoTeamMembers.map((member) => member.role))].map((role) => (
+                        <option key={role}>{role}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <div className="team-member-list">
+                  {visibleTeamMembers.map((member) => (
+                    <article className="team-member-card" key={member.id}>
+                      <div className={`team-avatar team-avatar-${member.color}`} aria-hidden="true">{member.initials}</div>
+                      <div className="team-member-main">
+                        <div className="team-member-name-row">
+                          <h4>{member.name}</h4>
+                          <span className={`team-member-status team-status-${member.status.toLowerCase().replace(' ', '-')}`}>
+                            <span />{member.status}
+                          </span>
+                        </div>
+                        <p>{member.role}</p>
+                        <span className="team-member-focus">{member.focus}</span>
+                      </div>
+                      <div className="team-member-progress">
+                        <div><span>Tasks</span><strong>{member.tasksDone}/{member.tasksTotal}</strong></div>
+                        <div className="team-progress-track" role="progressbar" aria-label={`${member.name} task progress`} aria-valuenow={Math.round(member.tasksDone / member.tasksTotal * 100)} aria-valuemin="0" aria-valuemax="100">
+                          <span style={{ width: `${member.tasksDone / member.tasksTotal * 100}%` }} />
+                        </div>
+                      </div>
+                      <a className="team-member-email" href={`mailto:${member.email}`} aria-label={`Email ${member.name}`}>
+                        <ArrowUpRight size={17} aria-hidden="true" />
+                      </a>
+                    </article>
+                  ))}
+                  {visibleTeamMembers.length === 0 && (
+                    <p className="team-empty-state" role="status">No teammates match your search.</p>
+                  )}
+                </div>
+              </section>
+
+              <aside className="team-panel team-activity-panel" aria-labelledby="team-activity-heading">
+                <div className="team-panel-heading">
+                  <div>
+                    <p className="dashboard-eyebrow">Latest updates</p>
+                    <h3 id="team-activity-heading">Team activity</h3>
+                  </div>
+                  <span className="team-live-indicator"><span /> Sample feed</span>
+                </div>
+                <ol className="team-activity-list">
+                  {demoTeamActivity.map((item) => {
+                    const EventIcon = item.icon;
+                    return (
+                      <li className="team-activity-item" key={item.id}>
+                        <div className={`team-avatar team-avatar-small team-avatar-${item.color}`} aria-hidden="true">{item.initials}</div>
+                        <div className="team-activity-content">
+                          <p><strong>{item.name}</strong> {item.action} <b>{item.subject}</b></p>
+                          <span>{item.project}</span>
+                          <small><EventIcon size={13} aria-hidden="true" />{item.time}</small>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </aside>
             </div>
+
+            <section className="team-panel team-project-progress-panel" aria-labelledby="team-projects-heading">
+              <div className="team-panel-heading">
+                <div>
+                  <p className="dashboard-eyebrow">Shared focus</p>
+                  <h3 id="team-projects-heading">Project progress</h3>
+                </div>
+                <button type="button" className="team-text-button" onClick={() => setActiveTab('projects')}>
+                  View projects <ArrowRight size={15} aria-hidden="true" />
+                </button>
+              </div>
+              <div className="team-project-progress-grid">
+                {[
+                  { name: 'Customer Portal Redesign', label: 'Design system and self-service experience', progress: 68, color: 'green', due: 'Due Jun 28' },
+                  { name: 'Billing Experience', label: 'Simplify plans, invoices, and payment updates', progress: 42, color: 'blue', due: 'Due Jul 05' },
+                  { name: 'Mobile App Launch', label: 'Prepare the first public release', progress: 81, color: 'violet', due: 'Due Jul 12' },
+                ].map((project) => (
+                  <article className="team-project-card" key={project.name}>
+                    <div className="team-project-card-heading">
+                      <span className={`team-project-dot team-project-dot-${project.color}`} />
+                      <span>{project.due}</span>
+                    </div>
+                    <h4>{project.name}</h4>
+                    <p>{project.label}</p>
+                    <div className="team-project-progress-label"><span>Overall progress</span><strong>{project.progress}%</strong></div>
+                    <div className={`team-progress-track team-project-track-${project.color}`} role="progressbar" aria-label={`${project.name} progress`} aria-valuenow={project.progress} aria-valuemin="0" aria-valuemax="100">
+                      <span style={{ width: `${project.progress}%` }} />
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
           </div>
         )}
 
