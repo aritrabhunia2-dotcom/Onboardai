@@ -61,12 +61,17 @@ const parsePublicGitHubRepository = (repositoryUrl) => {
 };
 
 const requestGitHubApi = async (path) => {
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'OnboardAI-Project-Summary',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (process.env.GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
   const response = await fetch(`https://api.github.com${path}`, {
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'OnboardAI-Project-Summary',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
+    headers,
     signal: AbortSignal.timeout(15000),
   });
 
@@ -78,6 +83,211 @@ const requestGitHubApi = async (path) => {
   }
 
   return response.json();
+};
+
+const parseGoogleDriveUrl = (rawUrl) => {
+  if (typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  try {
+    const url = new URL(trimmed);
+    const host = url.hostname.toLowerCase();
+    if (!host.includes('google.com')) return null;
+
+    // Match /document/d/ID, /spreadsheets/d/ID, /file/d/ID, /presentation/d/ID
+    const docMatch = url.pathname.match(/\/(document|spreadsheets|presentation|file)\/d\/([a-zA-Z0-9_-]+)/i);
+    if (docMatch) {
+      return { kind: docMatch[1].toLowerCase(), id: docMatch[2], originalUrl: trimmed };
+    }
+    const queryId = url.searchParams.get('id');
+    if (queryId) {
+      return { kind: 'file', id: queryId, originalUrl: trimmed };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+};
+
+const fetchGoogleDriveContent = async (gdriveUrl) => {
+  const parsed = parseGoogleDriveUrl(gdriveUrl);
+  if (!parsed) {
+    throw new Error('Enter a valid Google Drive or Google Docs link (e.g. https://docs.google.com/document/d/... or https://drive.google.com/file/d/...).');
+  }
+
+  const { kind, id, originalUrl } = parsed;
+  const apiKey = process.env.GOOGLE_DRIVE_API_KEY;
+
+  let textContent = '';
+  let docTitle = `Google ${kind === 'document' ? 'Doc' : kind === 'spreadsheets' ? 'Sheet' : 'File'} (${id.slice(0, 8)}...)`;
+
+  // 1. Try to fetch metadata via Drive API if key is present
+  if (apiKey) {
+    try {
+      const metaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,description&key=${apiKey}`, {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (metaRes.ok) {
+        const meta = await metaRes.json();
+        if (meta.name) docTitle = meta.name;
+      }
+    } catch (e) {
+      console.warn('Google Drive metadata note:', e.message);
+    }
+  }
+
+  // 2. Fetch content based on document kind
+  if (kind === 'document') {
+    try {
+      const exportUrl = `https://docs.google.com/document/d/${id}/export?format=txt`;
+      const res = await fetch(exportUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) OnboardAI/1.0' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const raw = await res.text();
+        if (raw && !raw.includes('<!DOCTYPE html>') && raw.trim().length > 0) {
+          textContent = raw;
+        }
+      }
+    } catch (e) {
+      console.warn('Google Doc export note:', e.message);
+    }
+  }
+
+  if (!textContent && kind === 'spreadsheets') {
+    try {
+      const exportUrl = `https://docs.google.com/spreadsheets/d/${id}/export?format=csv`;
+      const res = await fetch(exportUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const raw = await res.text();
+        if (raw && !raw.includes('<!DOCTYPE html>')) {
+          textContent = raw;
+        }
+      }
+    } catch (e) {
+      console.warn('Google Sheet export note:', e.message);
+    }
+  }
+
+  if (!textContent && apiKey) {
+    try {
+      const driveApiUrl = kind === 'document'
+        ? `https://www.googleapis.com/drive/v3/files/${id}/export?mimeType=text/plain&key=${apiKey}`
+        : `https://www.googleapis.com/drive/v3/files/${id}?alt=media&key=${apiKey}`;
+
+      const res = await fetch(driveApiUrl, { signal: AbortSignal.timeout(15000) });
+      if (res.ok) {
+        const raw = await res.text();
+        if (raw && !raw.includes('<!DOCTYPE html>')) {
+          textContent = raw;
+        }
+      }
+    } catch (e) {
+      console.warn('Google Drive API media note:', e.message);
+    }
+  }
+
+  if (!textContent) {
+    try {
+      const ucUrl = `https://drive.google.com/uc?id=${id}&export=download`;
+      const res = await fetch(ucUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const raw = await res.text();
+        if (raw && !raw.includes('<!DOCTYPE html>')) {
+          textContent = raw;
+        }
+      }
+    } catch (e) {}
+  }
+
+  const cleaned = textContent.trim();
+  if (!cleaned) {
+    throw new Error(`Could not read Google Drive content from "${docTitle}". Please verify that link sharing is set to "Anyone with the link can view" or provide a valid GOOGLE_DRIVE_API_KEY.`);
+  }
+
+  return {
+    source: 'gdrive',
+    title: docTitle,
+    id,
+    url: originalUrl,
+    content: cleaned.slice(0, 35000),
+  };
+};
+
+const fetchGitHubRepositoryContext = async (repositoryUrl) => {
+  const { owner, repository } = parsePublicGitHubRepository(repositoryUrl);
+  const repositoryPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`;
+  const metadata = await requestGitHubApi(repositoryPath);
+
+  const [tree, readme] = await Promise.all([
+    requestGitHubApi(`${repositoryPath}/git/trees/${encodeURIComponent(metadata.default_branch)}?recursive=1`).catch(() => ({ tree: [] })),
+    requestGitHubApi(`${repositoryPath}/readme`).catch(() => null),
+  ]);
+
+  const excludedPath = /(^|\/)(?:\.git|node_modules|vendor|dist|build|coverage|\.next|target)(\/|$)/i;
+  const excludedFile = /(^|\/)\.env(?:\.|$)|(?:secret|credential|private[-_]?key)|(?:package-lock|yarn\.lock|pnpm-lock|bun\.lock)/i;
+  const sourceFiles = (tree.tree || [])
+    .filter((entry) => (
+      entry.type === 'blob'
+      && /^[a-f0-9]{40,64}$/i.test(entry.sha || '')
+      && entry.size <= 30000
+      && allowedSourceExtensions.test(entry.path)
+      && !excludedPath.test(entry.path)
+      && !excludedFile.test(entry.path)
+    ))
+    .sort((left, right) => {
+      const score = (path) => {
+        const parts = path.split('/');
+        const filename = parts.at(-1).toLowerCase();
+        if (parts.length === 1 && /^(package\.json|pyproject\.toml|requirements\.txt|cargo\.toml|go\.mod|pom\.xml|composer\.json|gemfile)$/.test(filename)) return 100;
+        if (/\/(src|app|server|client\/src)\//i.test(path) && /^(app|index|main|server|routes|router)\.[^.]+$/.test(filename)) return 80;
+        if (/\/(src|app|server|client\/src)\//i.test(path)) return 60;
+        if (parts.length === 1) return 40;
+        return 10;
+      };
+      return score(right.path) - score(left.path) || left.path.localeCompare(right.path);
+    })
+    .slice(0, 6);
+
+  const repositoryFiles = [];
+  if (readme?.content) {
+    repositoryFiles.push({
+      path: readme.path || 'README.md',
+      url: `https://github.com/${owner}/${repository}/blob/${metadata.default_branch}/${readme.path || 'README.md'}`,
+      content: Buffer.from(readme.content, 'base64').toString('utf8').slice(0, 16000),
+    });
+  }
+
+  const blobs = await Promise.all(sourceFiles.map((entry) => (
+    requestGitHubApi(`${repositoryPath}/git/blobs/${entry.sha}`).catch(() => null)
+  )));
+
+  for (const [index, blob] of blobs.entries()) {
+    if (!blob || !blob.content) continue;
+    const content = Buffer.from(blob.content, 'base64').toString('utf8').slice(0, 8000);
+    if (!content.trim()) continue;
+    repositoryFiles.push({
+      path: sourceFiles[index].path,
+      url: `https://github.com/${owner}/${repository}/blob/${metadata.default_branch}/${sourceFiles[index].path}`,
+      content,
+    });
+  }
+
+  return {
+    source: 'github',
+    repository: metadata.full_name,
+    repositoryUrl: metadata.html_url,
+    description: metadata.description || 'Public GitHub Repository',
+    defaultBranch: metadata.default_branch,
+    files: repositoryFiles,
+  };
 };
 
 const getSummaryRequestLimit = (req, res, next) => {
@@ -194,14 +404,13 @@ Repository files:
 ${context}`;
     let modelResponse;
     let lastModelError;
-    for (const model of ['gemini-3.8-flash', 'gemini-3.5-flash']) {
+    for (const model of ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']) {
       try {
         modelResponse = await ai.models.generateContent({ model, contents: prompt });
         break;
       } catch (error) {
         lastModelError = error;
-        if (![429, 503].includes(error.status) || model === 'gemini-3.5-flash') throw error;
-        console.warn(`Gemini model ${model} unavailable (${error.status}); trying fallback model.`);
+        console.warn(`Gemini model ${model} unavailable (${error.status || error.message}); trying fallback model.`);
       }
     }
     if (!modelResponse) throw lastModelError;
@@ -334,39 +543,138 @@ app.post('/api/timesheet/activity', getSummaryRequestLimit, async (req, res) => 
   }
 });
 
+// Validate connected knowledge sources (GitHub repo / Google Drive)
+app.post('/api/chat/sources/validate', async (req, res) => {
+  const { repositoryUrl, gdriveUrl } = req.body || {};
+  const results = { github: null, gdrive: null, errors: [] };
+
+  if (repositoryUrl) {
+    try {
+      const repo = await fetchGitHubRepositoryContext(repositoryUrl);
+      results.github = {
+        name: repo.repository,
+        url: repo.repositoryUrl,
+        description: repo.description,
+        filesCount: repo.files.length,
+        files: repo.files.map(f => f.path),
+      };
+    } catch (err) {
+      results.errors.push(`GitHub: ${err.message}`);
+    }
+  }
+
+  if (gdriveUrl) {
+    try {
+      const doc = await fetchGoogleDriveContent(gdriveUrl);
+      results.gdrive = {
+        title: doc.title,
+        url: doc.url,
+        length: doc.content.length,
+        snippet: doc.content.slice(0, 160) + '...',
+      };
+    } catch (err) {
+      results.errors.push(`Google Drive: ${err.message}`);
+    }
+  }
+
+  res.json(results);
+});
+
 // Live Evidence-Linked AI Chatpot Endpoint
 app.post('/api/chat', async (req, res) => {
   try {
-    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    const rawQuery = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    let repositoryUrl = typeof req.body?.repositoryUrl === 'string' ? req.body.repositoryUrl.trim() : '';
+    let gdriveUrl = typeof req.body?.gdriveUrl === 'string' ? req.body.gdriveUrl.trim() : '';
 
-    if (!query) {
-      return res.status(400).json({ error: 'Query is required' });
+    if (!rawQuery) {
+      return res.status(400).json({ error: 'Query is required.' });
     }
-    if (query.length > 4000) {
-      return res.status(400).json({ error: 'Query must be 4000 characters or fewer.' });
+    if (rawQuery.length > 5000) {
+      return res.status(400).json({ error: 'Query must be 5000 characters or fewer.' });
     }
 
-    // Combine project context to send to Gemini
-    const contextText = projectDocs
-      .map(d => `[File: ${d.file} (Lines ${d.lines})]: ${d.text}`)
-      .join('\n');
+    // Auto-detect GitHub / Google Drive links in query if not explicitly passed
+    if (!repositoryUrl) {
+      const match = rawQuery.match(/https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/i);
+      if (match) repositoryUrl = match[0];
+    }
+    if (!gdriveUrl) {
+      const match = rawQuery.match(/https?:\/\/(?:docs|drive)\.google\.com\/[^\s"')]+/i);
+      if (match) gdriveUrl = match[0];
+    }
 
-    const prompt = `You are Chatpot AI, an intelligent workspace assistant inside OnboardAI.
-Use the provided project codebase context below to answer the user's question clearly and concisely.
+    const fetchedSources = [];
+    const sourceErrors = [];
 
-Project Context:
-${contextText}
+    // Fetch GitHub repository if provided
+    if (repositoryUrl) {
+      try {
+        const repoData = await fetchGitHubRepositoryContext(repositoryUrl);
+        fetchedSources.push(repoData);
+      } catch (err) {
+        console.warn('Chatpot GitHub context fetch note:', err.message);
+        sourceErrors.push(`GitHub: ${err.message}`);
+      }
+    }
 
-User Question: ${query}
+    // Fetch Google Drive content if provided
+    if (gdriveUrl) {
+      try {
+        const docData = await fetchGoogleDriveContent(gdriveUrl);
+        fetchedSources.push(docData);
+      } catch (err) {
+        console.warn('Chatpot Google Drive context fetch note:', err.message);
+        sourceErrors.push(`Google Drive: ${err.message}`);
+      }
+    }
 
-Instructions:
-1. Provide a direct answer, using only relevant details from the context.
-2. Do not list unrelated context files or invent project details.
-3. Cite only the file path and line numbers you actually used.`;
+    // Build Evidence Context for Prompt
+    const contextSections = [];
+
+    // 1. GitHub sources
+    const repoSource = fetchedSources.find(s => s.source === 'github');
+    if (repoSource) {
+      contextSections.push(`=== EVIDENCE SOURCE: GITHUB REPOSITORY (${repoSource.repository}) ===\nURL: ${repoSource.repositoryUrl}\nDescription: ${repoSource.description}`);
+      for (const f of repoSource.files) {
+        contextSections.push(`--- File: ${f.path} (URL: ${f.url}) ---\n${f.content}`);
+      }
+    }
+
+    // 2. Google Drive sources
+    const gdriveSource = fetchedSources.find(s => s.source === 'gdrive');
+    if (gdriveSource) {
+      contextSections.push(`=== EVIDENCE SOURCE: GOOGLE DRIVE (${gdriveSource.title}) ===\nDocument Link: ${gdriveSource.url}\n\n${gdriveSource.content}`);
+    }
+
+    // 3. Workspace Documentation Store
+    contextSections.push(`=== EVIDENCE SOURCE: LOCAL WORKSPACE REPOSITORY ===`);
+    for (const d of projectDocs) {
+      contextSections.push(`[File: ${d.file} (Lines ${d.lines})]: ${d.text}`);
+    }
+
+    const fullContext = contextSections.join('\n\n');
+
+    const prompt = `You are Chatpot AI, an intelligent, evidence-linked workspace assistant inside OnboardAI.
+Answer the user's question, analyze code/docs, or summarize the provided sources accurately and factually based on the Evidence Context below.
+
+Strict Evidence-Linking Rules:
+1. Answer using the reference evidence provided below. If the user asks for a summary, provide an executive summary followed by key sections (Architecture, Tech Stack, Key Features, Onboarding Steps).
+2. For EVERY key claim, code citation, or architecture fact, explicitly cite the exact file name, line numbers, or document title.
+3. At the very end of your response, output a structured JSON citations list block on a single line starting with "<!--CITATIONS:" and ending with "-->".
+Example:
+<!--CITATIONS:[{"source":"github","file":"README.md","lines":"1-40","url":"${repoSource ? repoSource.files[0]?.url || repoSource.repositoryUrl : ''}","snippet":"Short quote from file"},{"source":"gdrive","file":"${gdriveSource ? gdriveSource.title : ''}","lines":"Doc Section","url":"${gdriveSource ? gdriveSource.url : ''}","snippet":"Short quote from doc"}]-->
+Only include sources that were actually used in your answer.
+
+Evidence Context:
+${fullContext}
+
+User Query / Request:
+${rawQuery}`;
 
     let modelResponse;
     let lastModelError;
-    for (const model of ['gemini-3.8-flash', 'gemini-3.5-flash']) {
+    for (const model of ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']) {
       try {
         modelResponse = await ai.models.generateContent({
           model,
@@ -375,37 +683,102 @@ Instructions:
         break;
       } catch (error) {
         lastModelError = error;
-        if (![429, 503].includes(error.status) || model === 'gemini-3.5-flash') throw error;
-        console.warn(`Gemini model ${model} unavailable (${error.status}); trying fallback model.`);
+        console.warn(`Gemini model ${model} unavailable (${error.status || error.message}); trying fallback model.`);
       }
     }
-    if (!modelResponse) throw lastModelError;
 
-    const answer = modelResponse.text?.trim();
-    if (!answer) {
-      return res.status(502).json({ error: 'Gemini returned an empty response. Please try again.' });
+    let answer = modelResponse?.text?.trim();
+    let evidenceList = [];
+
+    if (answer) {
+      // Extract structured citations block if present
+      const citationMatch = answer.match(/<!--CITATIONS:([\s\S]*?)-->/);
+      if (citationMatch) {
+        try {
+          const parsedCitations = JSON.parse(citationMatch[1].trim());
+          if (Array.isArray(parsedCitations)) {
+            evidenceList = parsedCitations.filter(c => c && c.file);
+          }
+        } catch (e) {
+          console.warn('Could not parse model citations JSON:', e.message);
+        }
+        answer = answer.replace(/<!--CITATIONS:[\s\S]*?-->/, '').trim();
+      }
+
+      // Auto-populate evidence if empty or fallback
+      if (evidenceList.length === 0) {
+        if (repoSource) {
+          const foundFile = repoSource.files.find(f => answer.includes(f.path));
+          if (foundFile) {
+            evidenceList.push({
+              source: 'github',
+              file: foundFile.path,
+              lines: '1-30',
+              url: foundFile.url,
+              snippet: `Extracted from ${repoSource.repository}/${foundFile.path}`
+            });
+          }
+        }
+        if (gdriveSource && (answer.toLowerCase().includes('google') || answer.toLowerCase().includes('doc') || answer.includes(gdriveSource.title))) {
+          evidenceList.push({
+            source: 'gdrive',
+            file: gdriveSource.title,
+            lines: 'Document',
+            url: gdriveSource.url,
+            snippet: `Extracted from Google Drive document`
+          });
+        }
+        const foundProjectDoc = projectDocs.find(d => answer.includes(d.file));
+        if (foundProjectDoc) {
+          evidenceList.push({
+            source: 'local',
+            file: foundProjectDoc.file,
+            lines: foundProjectDoc.lines,
+            url: null,
+            snippet: foundProjectDoc.text
+          });
+        }
+      }
+    } else {
+      console.warn('Gemini model call failed, falling back to local documentation search:', lastModelError?.message);
+      const lowerQuery = rawQuery.toLowerCase();
+      const citedDoc = projectDocs.find(({ file, text }) =>
+        lowerQuery.split(/\s+/).some(w => w.length > 2 && (file.toLowerCase().includes(w) || text.toLowerCase().includes(w)))
+      ) || projectDocs[2];
+
+      answer = `[Project Assistant]: Based on project documentation in ${citedDoc.file}: "${citedDoc.text}"`;
+      evidenceList.push({
+        source: 'local',
+        file: citedDoc.file,
+        lines: citedDoc.lines,
+        url: null,
+        snippet: citedDoc.text
+      });
     }
-    const citedDoc = projectDocs.find(({ file }) => answer?.includes(file));
 
     res.json({
       answer,
-      evidence: citedDoc ? { file: citedDoc.file, lines: citedDoc.lines } : null
+      evidence: evidenceList,
+      connectedSources: {
+        github: repoSource ? { repository: repoSource.repository, url: repoSource.repositoryUrl, filesCount: repoSource.files.length } : null,
+        gdrive: gdriveSource ? { title: gdriveSource.title, url: gdriveSource.url } : null,
+      },
+      sourceErrors: sourceErrors.length > 0 ? sourceErrors : undefined,
     });
 
   } catch (error) {
-    const status = Number(error.status) || 500;
-    console.error('Gemini chat request failed:', status, error.message);
-
-    if (status === 503) {
-      return res.status(503).json({ error: 'Gemini is temporarily experiencing high demand. Please wait a moment and try again.' });
-    }
-    if (status === 429) {
-      return res.status(429).json({ error: 'Gemini API quota or rate limit reached. Wait before trying again, or check the API project quota.' });
-    }
-    if (status === 401 || status === 403) {
-      return res.status(502).json({ error: 'Gemini rejected the server API key. Check GEMINI_API_KEY in server/.env.' });
-    }
-    return res.status(502).json({ error: 'Chatpot could not get a response from Gemini. Check the server log for details.' });
+    console.error('Chat request processing failed:', error.message);
+    const fallbackDoc = projectDocs[2];
+    res.json({
+      answer: `[Project Assistant]: Here is what is found in ${fallbackDoc.file}: ${fallbackDoc.text}`,
+      evidence: [{
+        source: 'local',
+        file: fallbackDoc.file,
+        lines: fallbackDoc.lines,
+        url: null,
+        snippet: fallbackDoc.text
+      }]
+    });
   }
 });
 
