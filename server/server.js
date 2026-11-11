@@ -407,7 +407,7 @@ Repository files:
 ${context}`;
     let modelResponse;
     let lastModelError;
-    for (const model of ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']) {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.5-flash']) {
       try {
         modelResponse = await ai.models.generateContent({ model, contents: prompt });
         break;
@@ -677,7 +677,7 @@ ${rawQuery}`;
 
     let modelResponse;
     let lastModelError;
-    for (const model of ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash']) {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.5-flash']) {
       try {
         modelResponse = await ai.models.generateContent({
           model,
