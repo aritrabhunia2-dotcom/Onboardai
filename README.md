@@ -119,8 +119,12 @@ Edit `client/.env` (or `.env.local`):
 ```env
 VITE_SUPABASE_URL=https://your-project.supabase.co
 VITE_SUPABASE_ANON_KEY=your-supabase-publishable-anon-key
-VITE_API_BASE_URL=http://localhost:5000
 ```
+
+The client uses same-origin `/api` requests by default. During local development,
+Vite proxies these requests to `http://localhost:5000`; on Vercel, the project
+rewrites `/api/*` to the Express service. Set `VITE_API_BASE_URL` only when
+intentionally using a separately hosted API.
 
 Start the frontend development server:
 ```bash
@@ -168,4 +172,3 @@ curl http://localhost:5000/api/health
 
 ## 📄 License
 MIT License. Created for Developer Onboarding & AI Productivity.
-

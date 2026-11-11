@@ -83,7 +83,7 @@ const timesheetSections = [
 
 const bugs = [];
 const blockers = [];
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/$/, '');
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
 const formatCountdown = (milliseconds) => {
   const totalSeconds = Math.floor(Math.abs(milliseconds) / 1000);
@@ -776,7 +776,7 @@ export default function App() {
           user: query,
           ai: err.name === 'TimeoutError'
             ? 'Chatpot took too long to respond. Please try again.'
-            : err.message || `Unable to reach backend server at ${apiBaseUrl}.`,
+            : err.message || `Unable to reach backend server${apiBaseUrl ? ` at ${apiBaseUrl}` : ''}.`,
           evidence: []
         }
       ]);
