@@ -8,7 +8,10 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize Google Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const geminiApiKey = process.env.GEMINI_API_KEY
+  || process.env.GOOGLE_API_KEY
+  || process.env['Google-AI-Studio-API-key'];
+const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
 // Mock project documentation store (Context Ingestion for RAG)
 const projectDocs = [
